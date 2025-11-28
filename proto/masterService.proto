@@ -1,0 +1,64 @@
+syntax = "proto3" ;
+package master ;
+option go_package = "dfs/masterpb";
+message RegisterChunkServerRequest{
+    string server_address = 1;
+    int64 free_storage = 2;
+    repeated string chunks = 3;
+}
+
+message RegisterChunkServerResponse{
+    bool success = 1;
+}
+
+message HeartbeatRequest{
+    string server_address = 1;
+    int64 free_storage = 2;
+    repeated string chunks = 3; // stores chunk IDs
+}
+
+message HeartbeatResponse{
+    repeated ReplicationTask replication_tasks = 1;
+    repeated DeleteTask delete_tasks = 2;
+}
+
+message ReplicationTask{
+    string chunk_id = 1;
+    string target_address = 2;
+}
+
+message DeleteTask{
+    string chunk_id = 1;
+}
+
+message AllocateChunkRequest{
+    string file_name = 1;
+    int32 chunk_index = 2;
+}
+
+message AllocateChunkResponse{
+    string chunk_id = 1;
+    repeated string replica_servers = 2;
+}
+
+message GetFileInfoRequest{
+    string file_name = 1;
+}
+
+message GetFileInfoResponse{
+    repeated FileChunkInfo file_info = 1;
+}
+
+message FileChunkInfo{
+    string chunk_id = 1;
+    repeated string replica_servers = 2; 
+}
+
+
+service MasterService{
+	rpc GetFileInfo( GetFileInfoRequest ) returns ( GetFileInfoResponse ) ;
+	rpc AllocateChunk( AllocateChunkRequest ) returns ( AllocateChunkResponse ) ;
+	rpc RegisterChunkServer( RegisterChunkServerRequest ) returns ( RegisterChunkServerResponse ) ;
+	rpc Heartbeat ( stream HeartbeatRequest ) returns ( stream HeartbeatResponse ) ;
+}
+
