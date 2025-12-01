@@ -11,6 +11,9 @@ import (
 	"google.golang.org/grpc"
 )
 
+// hardcoding replication factor for now
+var REPLICATION_FACTOR int = 2
+
 type MasterServer struct {
 	masterpb.UnimplementedMasterServiceServer
 	mu           sync.Mutex
@@ -33,6 +36,7 @@ type FileMetaData struct {
 
 type ChunkInfo struct {
 	ChunkID  string
+	FileName string
 	Replicas map[string]bool
 }
 
@@ -88,38 +92,132 @@ func (ms *MasterServer) RegisterChunkServer(ctx context.Context, req *masterpb.R
 func (ms *MasterServer) Heartbeat(stream grpc.BidiStreamingServer[masterpb.HeartbeatRequest, masterpb.HeartbeatResponse]) error {
 
 	for {
-
 		msg, err := stream.Recv()
 		if err == io.EOF {
 			break
 		}
-
 		if err != nil {
 			return err
 		}
-		//msg --> chunks , freeStorage , server Address
+
+		// Check if the server address exists
+		serverAddress := msg.GetServerAddress()
+
 		ms.mu.Lock()
 
-		if _, ok := ms.ChunkServers[msg.GetServerAddress()]; !ok {
+		if _, ok := ms.ChunkServers[serverAddress]; !ok {
+			ms.mu.Unlock()
 			return fmt.Errorf("Server Not Registered")
 		}
+		ms.ChunkServers[serverAddress].FreeStorage = msg.GetFreeStorage()
+		ms.ChunkServers[serverAddress].LastHeartbeat = time.Now().UTC()
 
-		ms.ChunkServers[msg.GetServerAddress()].FreeStorage = msg.GetFreeStorage()
-		ms.ChunkServers[msg.GetServerAddress()].LastHeartbeat = time.Now()
+		serverChunks := make(map[string]bool)
 
-		chunks := make(map[string]bool)
-
-		for _, chunk := range msg.Chunks {
-			chunks[chunk] = true
+		for _, chunk := range msg.GetChunks() {
+			serverChunks[chunk] = true
 		}
 
-		// Identify chunks missing from this server (delete tasks)
+		// find missing chunks
+		missingChunks := make([]string, 0)
+		for chunk := range ms.ChunkServers[serverAddress].Chunks {
 
-		// Update global chunk -> replica mapping
+			if _, ok := serverChunks[chunk]; !ok {
+				missingChunks = append(missingChunks, chunk)
+			}
 
-		// Determine replication tasks
+		}
 
+		newChunks := make([]string, 0)
+
+		for chunk := range serverChunks {
+			if _, ok := ms.ChunkServers[serverAddress].Chunks[chunk]; !ok {
+				newChunks = append(newChunks, chunk)
+			}
+		}
+
+		rep1 := ms.processMissingChunks(serverAddress, missingChunks)
+
+		rep2, deleteTask := ms.processNewChunks(serverAddress, newChunks)
+
+		rep1 = append(rep1, rep2...)
+
+		replicationTask := ms.buildReplicationTasks(serverAddress, rep1)
+
+		ms.ChunkServers[serverAddress].Chunks = serverChunks
 		ms.mu.Unlock()
+		if err := stream.Send(&masterpb.HeartbeatResponse{
+			ReplicationTasks: replicationTask,
+			DeleteTasks:      deleteTask,
+		}); err != nil {
+			return err
+		}
+
 	}
-	return fmt.Errorf("Some error for now")
+	return nil
+
+}
+
+func (ms *MasterServer) processMissingChunks(serverAddress string, missingChunks []string) []string {
+
+	rep := make([]string, 0)
+	for _, chunk := range missingChunks {
+		chunkInfo, ok := ms.Chunks[chunk]
+		if !ok {
+			continue
+		}
+		delete(chunkInfo.Replicas, serverAddress)
+
+		// if no file -> skip replication
+		if chunkInfo.FileName == "" || ms.Files[chunkInfo.FileName] == nil {
+			if len(chunkInfo.Replicas) == 0 {
+				delete(ms.Chunks, chunk)
+			}
+			continue
+		}
+
+		// if no replicas left -> metadata becomes invalid
+		if len(chunkInfo.Replicas) == 0 {
+			delete(ms.Chunks, chunk)
+			continue
+		}
+		if len(chunkInfo.Replicas) < REPLICATION_FACTOR {
+			rep = append(rep, chunk)
+		}
+	}
+
+	return rep
+}
+
+func (ms *MasterServer) processNewChunks(serverAddress string, newChunks []string) ([]string, []*masterpb.DeleteTask) {
+	rep, deleteTask := make([]string, 0), make([]*masterpb.DeleteTask, 0)
+
+	for _, chunk := range newChunks {
+		chunkInfo, ok := ms.Chunks[chunk]
+		if !ok {
+			deleteTask = append(deleteTask, &masterpb.DeleteTask{ChunkId: chunk})
+			continue
+		}
+
+		if chunkInfo.FileName == "" || ms.Files[chunkInfo.FileName] == nil {
+			deleteTask = append(deleteTask, &masterpb.DeleteTask{ChunkId: chunk})
+			continue
+		}
+
+		chunkInfo.Replicas[serverAddress] = true
+
+		if len(chunkInfo.Replicas) > REPLICATION_FACTOR {
+			deleteTask = append(deleteTask, &masterpb.DeleteTask{ChunkId: chunk})
+			continue
+		}
+		if len(chunkInfo.Replicas) < REPLICATION_FACTOR {
+			rep = append(rep, chunk)
+		}
+
+	}
+	return rep, deleteTask
+
+}
+func (ms *MasterServer) buildReplicationTasks(serverAddress string, rep []string) []*masterpb.ReplicationTask {
+	return make([]*masterpb.ReplicationTask, 0)
 }
