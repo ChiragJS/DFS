@@ -5,6 +5,8 @@ import (
 	"dfs/dfs/masterpb"
 	"fmt"
 	"io"
+	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -14,12 +16,15 @@ import (
 // hardcoding replication factor for now
 var REPLICATION_FACTOR int = 2
 
+const CHUNK_SIZE int64 = 64 * 1024 * 1024 // 64MB
+
 type MasterServer struct {
 	masterpb.UnimplementedMasterServiceServer
-	mu           sync.Mutex
-	ChunkServers map[string]*ChunkServerInfo
-	Files        map[string]*FileMetaData
-	Chunks       map[string]*ChunkInfo
+	mu               sync.Mutex
+	ChunkServers     map[string]*ChunkServerInfo
+	Files            map[string]*FileMetaData
+	Chunks           map[string]*ChunkInfo
+	ReplicationWorks map[string][]*ReplicationWork
 }
 
 type ChunkServerInfo struct {
@@ -40,11 +45,17 @@ type ChunkInfo struct {
 	Replicas map[string]bool
 }
 
+type ReplicationWork struct {
+	TargetAddress string
+	ChunkID       string
+}
+
 func NewMasterServer() *MasterServer {
 	return &MasterServer{
-		ChunkServers: make(map[string]*ChunkServerInfo),
-		Files:        make(map[string]*FileMetaData),
-		Chunks:       make(map[string]*ChunkInfo),
+		ChunkServers:     make(map[string]*ChunkServerInfo),
+		Files:            make(map[string]*FileMetaData),
+		Chunks:           make(map[string]*ChunkInfo),
+		ReplicationWorks: make(map[string][]*ReplicationWork),
 	}
 }
 
@@ -107,7 +118,7 @@ func (ms *MasterServer) Heartbeat(stream grpc.BidiStreamingServer[masterpb.Heart
 
 		if _, ok := ms.ChunkServers[serverAddress]; !ok {
 			ms.mu.Unlock()
-			return fmt.Errorf("Server Not Registered")
+			return fmt.Errorf("server not registered")
 		}
 		ms.ChunkServers[serverAddress].FreeStorage = msg.GetFreeStorage()
 		ms.ChunkServers[serverAddress].LastHeartbeat = time.Now().UTC()
@@ -142,8 +153,16 @@ func (ms *MasterServer) Heartbeat(stream grpc.BidiStreamingServer[masterpb.Heart
 
 		rep1 = append(rep1, rep2...)
 
-		replicationTask := ms.buildReplicationTasks(serverAddress, rep1)
+		ms.buildReplicationTasks(rep1)
 
+		replicationTask := make([]*masterpb.ReplicationTask, 0)
+		for _, work := range ms.ReplicationWorks[serverAddress] {
+			replicationTask = append(replicationTask, &masterpb.ReplicationTask{
+				ChunkId:       work.ChunkID,
+				TargetAddress: work.TargetAddress,
+			})
+		}
+		// clear assigned tasks
 		ms.ChunkServers[serverAddress].Chunks = serverChunks
 		ms.mu.Unlock()
 		if err := stream.Send(&masterpb.HeartbeatResponse{
@@ -152,7 +171,9 @@ func (ms *MasterServer) Heartbeat(stream grpc.BidiStreamingServer[masterpb.Heart
 		}); err != nil {
 			return err
 		}
-
+		ms.mu.Lock()
+		ms.ReplicationWorks[serverAddress] = make([]*ReplicationWork, 0)
+		ms.mu.Unlock()
 	}
 	return nil
 
@@ -218,6 +239,196 @@ func (ms *MasterServer) processNewChunks(serverAddress string, newChunks []strin
 	return rep, deleteTask
 
 }
-func (ms *MasterServer) buildReplicationTasks(serverAddress string, rep []string) []*masterpb.ReplicationTask {
-	return make([]*masterpb.ReplicationTask, 0)
+func (ms *MasterServer) buildReplicationTasks(rep []string) {
+
+	const liveThreshold = 30 * time.Second
+	// local snapshot of free server storage
+	serverStorage := make(map[string]int64)
+	for addr, info := range ms.ChunkServers {
+		serverStorage[addr] = info.FreeStorage
+	}
+
+	type srv struct {
+		addr  string
+		free  int64
+		alive bool
+	}
+	servers := make([]srv, 0, len(ms.ChunkServers))
+
+	for addr, info := range ms.ChunkServers {
+		servers = append(servers, srv{
+			addr:  addr,
+			free:  info.FreeStorage,
+			alive: time.Since(info.LastHeartbeat) <= liveThreshold,
+		})
+	}
+
+	// highest free storage first
+	sort.Slice(servers, func(i, j int) bool {
+		return servers[i].free > servers[j].free
+	})
+
+	for _, chunkID := range rep {
+
+		ci, ok := ms.Chunks[chunkID]
+		if !ok {
+			continue
+		}
+
+		replicasNeeded := REPLICATION_FACTOR - len(ci.Replicas)
+		if replicasNeeded <= 0 {
+			continue
+		}
+		// source selection
+		var source string
+		for replica := range ci.Replicas {
+			if info := ms.ChunkServers[replica]; time.Since(info.LastHeartbeat) <= liveThreshold {
+				source = replica
+				break
+			}
+		}
+		if source == "" {
+			continue // no alive replica to supply the chunk
+		}
+		// target selection
+		targets := make([]string, 0)
+
+		for _, s := range servers {
+
+			if replicasNeeded == 0 {
+				break
+			}
+
+			if !s.alive {
+				continue
+			}
+
+			if _, alreadyReplica := ci.Replicas[s.addr]; alreadyReplica {
+				continue
+			}
+
+			if serverStorage[s.addr] < CHUNK_SIZE {
+				continue
+			}
+
+			targets = append(targets, s.addr)
+			serverStorage[s.addr] -= CHUNK_SIZE // simulation
+			replicasNeeded--
+		}
+		// add tasks to ReplicationWorks
+		for _, dest := range targets {
+			work := &ReplicationWork{
+				TargetAddress: dest,
+				ChunkID:       chunkID,
+			}
+			ms.ReplicationWorks[source] = append(ms.ReplicationWorks[source], work)
+		}
+	}
+}
+
+func (ms *MasterServer) GetFileInfo(ctx context.Context, fileInfo *masterpb.GetFileInfoRequest) (*masterpb.GetFileInfoResponse, error) {
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+
+	fileMetaData, exists := ms.Files[fileInfo.GetFileName()]
+	if !exists {
+		return &masterpb.GetFileInfoResponse{
+			FileInfo: make([]*masterpb.FileChunkInfo, 0),
+		}, fmt.Errorf("file does not exist")
+	}
+
+	chunks := make([]*masterpb.FileChunkInfo, 0)
+
+	for _, chunkID := range fileMetaData.Chunks {
+		chunk, exists := ms.Chunks[chunkID]
+		if !exists {
+			continue
+		}
+		replicas := make([]string, 0)
+		for replica := range chunk.Replicas {
+			replicas = append(replicas, replica)
+		}
+
+		chunks = append(chunks, &masterpb.FileChunkInfo{
+			ChunkId:        chunkID,
+			ReplicaServers: replicas,
+		})
+	}
+
+	return &masterpb.GetFileInfoResponse{
+		FileInfo: chunks,
+	}, nil
+}
+
+func (ms *MasterServer) AllocateChunk(ctx context.Context, request *masterpb.AllocateChunkRequest) (*masterpb.AllocateChunkResponse, error) {
+
+	// gets the file name and chunk index number as input
+	// send the chunkId and the replica servers
+	const liveThreshold = 30 * time.Second
+	fileName := request.GetFileName()
+	chunkIdx := request.GetChunkIndex()
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+
+	fileMetaData, exists := ms.Files[fileName]
+	if !exists {
+		fileMetaData = &FileMetaData{
+			FileName: fileName,
+			Chunks:   make([]string, 0),
+		}
+		ms.Files[fileName] = fileMetaData
+	}
+
+	chunkID := fileName + "_" + strconv.Itoa(int(chunkIdx))
+	if _, exists := ms.Chunks[chunkID]; exists {
+		return &masterpb.AllocateChunkResponse{
+			ChunkId:        chunkID,
+			ReplicaServers: make([]string, 0),
+		}, fmt.Errorf(" chunk already exists ")
+	}
+	// alive servers
+
+	validServers := make([]*ChunkServerInfo, 0)
+
+	for _, serverInfo := range ms.ChunkServers {
+		if time.Since(serverInfo.LastHeartbeat) > liveThreshold || serverInfo.FreeStorage < CHUNK_SIZE {
+			continue
+		}
+		validServers = append(validServers, serverInfo)
+	}
+
+	if len(validServers) < REPLICATION_FACTOR {
+		return &masterpb.AllocateChunkResponse{
+			ChunkId:        chunkID,
+			ReplicaServers: make([]string, 0),
+		}, fmt.Errorf(" server count criteria not met ")
+	}
+
+	sort.Slice(validServers, func(i, j int) bool {
+		return validServers[i].FreeStorage > validServers[j].FreeStorage
+	})
+
+	replicaServers := []string{}
+	replicaServerMap := make(map[string]bool)
+
+	for i := 0; i < REPLICATION_FACTOR; i++ {
+		replicaServers = append(replicaServers, validServers[i].Address)
+		replicaServerMap[replicaServers[i]] = true
+		ms.ChunkServers[replicaServers[i]].Chunks[chunkID] = true
+		ms.ChunkServers[replicaServers[i]].FreeStorage -= CHUNK_SIZE
+	}
+
+	fileMetaData.Chunks = append(fileMetaData.Chunks, chunkID)
+	ms.Chunks[chunkID] = &ChunkInfo{
+		FileName: fileName,
+		ChunkID:  chunkID,
+		Replicas: replicaServerMap,
+	}
+
+	return &masterpb.AllocateChunkResponse{
+		ChunkId:        chunkID,
+		ReplicaServers: replicaServers,
+	}, nil
 }
