@@ -3,11 +3,13 @@ package chunkserver
 import (
 	"context"
 	"dfs/dfs/chunkpb"
+	"dfs/dfs/masterpb"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc"
@@ -19,6 +21,7 @@ type ChunkServer struct {
 	myAddress     string
 	masterAddress string
 	storageDir    string
+	chunks        []string
 }
 
 func NewChunkServer(myAddress, masterAddress, storageDir string) *ChunkServer {
@@ -26,6 +29,7 @@ func NewChunkServer(myAddress, masterAddress, storageDir string) *ChunkServer {
 		myAddress:     myAddress,
 		masterAddress: masterAddress,
 		storageDir:    storageDir,
+		chunks:        make([]string, 0),
 	}
 }
 
@@ -40,7 +44,11 @@ func (cs *ChunkServer) Start() error {
 	}
 	grpcServer := grpc.NewServer()
 	chunkpb.RegisterChunkServiceServer(grpcServer, cs)
+	// implement a go routine for registering the chunk server // call the master server from there , by creating a connection
+	cs.registerWithMaster()
 
+	go cs.runHeartbeat()
+	// the server will only start once it is registered on master
 	fmt.Println("ChunkServer listening on", cs.myAddress)
 	return grpcServer.Serve(lis)
 }
@@ -79,7 +87,7 @@ func (cs *ChunkServer) UploadChunk(
 
 	}
 	file.Close()
-
+	cs.chunks = append(cs.chunks, chunkId)
 	return stream.SendAndClose(&chunkpb.UploadChunkStatus{Success: true})
 }
 
@@ -176,3 +184,124 @@ func (cs *ChunkServer) ReplicateChunkToTarget(chunkId, targetAddress string) err
 
 	return nil
 }
+
+// keeps on trying until registered for now
+func (cs *ChunkServer) registerWithMaster() {
+	for {
+		conn, err := grpc.NewClient(
+			cs.masterAddress,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		)
+		if err != nil {
+			fmt.Println("Connection failed, retrying:", err)
+			time.Sleep(time.Second)
+			continue
+		}
+
+		client := masterpb.NewMasterServiceClient(conn)
+
+		free, err := disk_usage()
+		if err != nil {
+			fmt.Println("Disk usage error:", err)
+			time.Sleep(time.Second)
+			continue
+		}
+
+		chunks := cs.chunks
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		_, err = client.RegisterChunkServer(ctx, &masterpb.RegisterChunkServerRequest{
+			ServerAddress: cs.myAddress,
+			FreeStorage:   free,
+			Chunks:        chunks,
+		})
+
+		conn.Close()
+
+		if err != nil {
+			fmt.Println("registeration failed , retrying:", err)
+			time.Sleep(time.Second)
+			continue
+		}
+
+		fmt.Println("successfully registered with master")
+		return
+	}
+
+}
+
+func (cs *ChunkServer) runHeartbeat() {
+	// create a connection to master and every 5 seconds send the value
+
+	for {
+		conn, err := grpc.NewClient(cs.masterAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			fmt.Println("Connection failed to master")
+			continue
+		}
+		client := masterpb.NewMasterServiceClient(conn)
+		ctx := context.Background()
+		client.Heartbeat(ctx)
+		storage, err := disk_usage()
+		if err != nil {
+			fmt.Println("Disk Usage Error ")
+		}
+
+		stream, err := client.Heartbeat(ctx)
+		wg := new(sync.WaitGroup)
+		wg.Add(2)
+		// now one read thread and one write thread
+
+		// read thread
+		go func() {
+			defer wg.Done()
+			for {
+				msg, err := stream.Recv()
+				if err == io.EOF {
+					break
+				}
+				// no use of err here
+				if err != nil {
+					fmt.Printf("Error from reading thread of cs %s", cs.myAddress)
+					fmt.Println(err)
+					break // maybe ?? something to think of for now
+				}
+				deleteTask := msg.GetDeleteTasks()
+				replicationTask := msg.GetReplicationTasks()
+				// now i need to add this to a channel -> and have a different thread pulling from the channel
+				// create 2 channels , replication channel and deletion channel
+			}
+			// should i close the connection ?? idts for now
+			// i should wait for these threads to complete in this routine , since it is non blocking ... think about it for now
+			// need some condition to break out of this loop
+		}()
+		// write thread
+		go func() {
+			wg.Done()
+			for {
+				// gather the heartbeat response
+				heartbeat := &masterpb.HeartbeatRequest{
+					ServerAddress: cs.myAddress,
+					FreeStorage:   storage,
+					Chunks:        cs.chunks,
+				}
+
+				err := stream.Send(heartbeat)
+				if err != nil {
+					fmt.Printf("Error in sending heartbeat from cs %s", cs.myAddress)
+				}
+				time.Sleep(time.Second * 5) // for now , need to check in the master service, what i have configured
+				// find the case to exit this infinite loop
+			}
+		}()
+
+		// use wait group , then the thread ends
+		wg.Wait()
+
+	}
+
+}
+
+// implement --> replicate task and delete task threads
