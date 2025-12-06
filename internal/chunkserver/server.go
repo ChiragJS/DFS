@@ -18,18 +18,22 @@ import (
 
 type ChunkServer struct {
 	chunkpb.UnimplementedChunkServiceServer
-	myAddress     string
-	masterAddress string
-	storageDir    string
-	chunks        []string
+	myAddress       string
+	masterAddress   string
+	storageDir      string
+	chunks          []string
+	replicationTask chan *masterpb.ReplicationTask
+	deleteTask      chan *masterpb.DeleteTask
 }
 
 func NewChunkServer(myAddress, masterAddress, storageDir string) *ChunkServer {
 	return &ChunkServer{
-		myAddress:     myAddress,
-		masterAddress: masterAddress,
-		storageDir:    storageDir,
-		chunks:        make([]string, 0),
+		myAddress:       myAddress,
+		masterAddress:   masterAddress,
+		storageDir:      storageDir,
+		chunks:          make([]string, 0),
+		replicationTask: make(chan *masterpb.ReplicationTask),
+		deleteTask:      make(chan *masterpb.DeleteTask),
 	}
 }
 
@@ -48,7 +52,9 @@ func (cs *ChunkServer) Start() error {
 	cs.registerWithMaster()
 
 	go cs.runHeartbeat()
+	go cs.replicateAndDeleteTasks()
 	// the server will only start once it is registered on master
+	// need a thread to monitor delete and replication --> will spawn two threads --> one will do replication , one will delete
 	fmt.Println("ChunkServer listening on", cs.myAddress)
 	return grpcServer.Serve(lis)
 }
@@ -270,8 +276,13 @@ func (cs *ChunkServer) runHeartbeat() {
 				}
 				deleteTask := msg.GetDeleteTasks()
 				replicationTask := msg.GetReplicationTasks()
-				// now i need to add this to a channel -> and have a different thread pulling from the channel
-				// create 2 channels , replication channel and deletion channel
+
+				for _, task := range deleteTask {
+					cs.deleteTask <- task
+				}
+				for _, task := range replicationTask {
+					cs.replicationTask <- task
+				}
 			}
 			// should i close the connection ?? idts for now
 			// i should wait for these threads to complete in this routine , since it is non blocking ... think about it for now
@@ -304,4 +315,39 @@ func (cs *ChunkServer) runHeartbeat() {
 
 }
 
-// implement --> replicate task and delete task threads
+func (cs *ChunkServer) replicateAndDeleteTasks() {
+
+	// replicate task , this is an infinitely running routine , since the channel is never closed
+	go func() {
+		for task := range cs.replicationTask {
+			// create a connection to a client
+			if err := cs.ReplicateChunkToTarget(task.GetChunkId(), task.GetTargetAddress()); err != nil {
+				fmt.Printf("Error in Replication %s\n", err)
+			}
+		}
+	}()
+	// delete task --> the channel never closes , so this is an infinitely running routine
+	go func() {
+		for task := range cs.deleteTask {
+			// delete these files from the disk
+			filePath := filepath.Join(cs.storageDir, task.GetChunkId())
+			if err := os.Remove(filePath); err != nil {
+				fmt.Printf("Error while deleting file %s\n", err)
+				continue
+			}
+			var index int
+			for idx, chunkId := range cs.chunks {
+				if chunkId == task.GetChunkId() {
+					index = idx
+					break
+				}
+			}
+
+			// deletion trick ( doesn't preserver order )
+			cs.chunks[index] = cs.chunks[len(cs.chunks)-1]
+			cs.chunks = cs.chunks[:len(cs.chunks)-1]
+
+		}
+	}()
+
+}
