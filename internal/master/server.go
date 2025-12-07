@@ -5,6 +5,7 @@ import (
 	"dfs/dfs/masterpb"
 	"fmt"
 	"io"
+	"net"
 	"sort"
 	"strconv"
 	"sync"
@@ -59,6 +60,18 @@ func NewMasterServer() *MasterServer {
 	}
 }
 
+func (ms *MasterServer) Start() error {
+	lis, err := net.Listen("tcp", ":8000")
+	if err != nil {
+		return err
+	}
+	grpcServer := grpc.NewServer()
+	masterpb.RegisterMasterServiceServer(grpcServer, ms)
+	fmt.Println("MasterServer listening on port 8000")
+	return grpcServer.Serve(lis)
+
+}
+
 /*
 GetFileInfo(context.Context, *GetFileInfoRequest) (*GetFileInfoResponse, error)
 AllocateChunk(context.Context, *AllocateChunkRequest) (*AllocateChunkResponse, error)
@@ -96,7 +109,7 @@ func (ms *MasterServer) RegisterChunkServer(ctx context.Context, req *masterpb.R
 			ms.Chunks[chunk] = chunkInfo
 		}
 	}
-
+	fmt.Println("Success registeration of chunk server %s\n", req.GetServerAddress())
 	return &masterpb.RegisterChunkServerResponse{Success: true}, nil
 }
 
@@ -110,7 +123,7 @@ func (ms *MasterServer) Heartbeat(stream grpc.BidiStreamingServer[masterpb.Heart
 		if err != nil {
 			return err
 		}
-
+		fmt.Printf("Heart beat from server : %s \n", msg.GetServerAddress())
 		// Check if the server address exists
 		serverAddress := msg.GetServerAddress()
 

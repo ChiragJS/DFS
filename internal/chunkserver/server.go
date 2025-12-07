@@ -21,6 +21,7 @@ type ChunkServer struct {
 	myAddress       string
 	masterAddress   string
 	storageDir      string
+	mu              sync.Mutex // implement this for locking chunks
 	chunks          []string
 	replicationTask chan *masterpb.ReplicationTask
 	deleteTask      chan *masterpb.DeleteTask
@@ -32,8 +33,8 @@ func NewChunkServer(myAddress, masterAddress, storageDir string) *ChunkServer {
 		masterAddress:   masterAddress,
 		storageDir:      storageDir,
 		chunks:          make([]string, 0),
-		replicationTask: make(chan *masterpb.ReplicationTask),
-		deleteTask:      make(chan *masterpb.DeleteTask),
+		replicationTask: make(chan *masterpb.ReplicationTask, 1000), // keep this in mind!!
+		deleteTask:      make(chan *masterpb.DeleteTask, 1000),
 	}
 }
 
@@ -87,13 +88,17 @@ func (cs *ChunkServer) UploadChunk(
 		}
 
 		_, err = file.Write(msg.GetData())
+		// handle partial writes , so maybe just remove the given file for now
 		if err != nil {
 			return err
 		}
 
 	}
+	file.Sync()
 	file.Close()
+	cs.mu.Lock()
 	cs.chunks = append(cs.chunks, chunkId)
+	cs.mu.Unlock()
 	return stream.SendAndClose(&chunkpb.UploadChunkStatus{Success: true})
 }
 
@@ -216,7 +221,6 @@ func (cs *ChunkServer) registerWithMaster() {
 		chunks := cs.chunks
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
 
 		_, err = client.RegisterChunkServer(ctx, &masterpb.RegisterChunkServerRequest{
 			ServerAddress: cs.myAddress,
@@ -233,6 +237,7 @@ func (cs *ChunkServer) registerWithMaster() {
 		}
 
 		fmt.Println("successfully registered with master")
+		cancel()
 		return
 	}
 
@@ -240,22 +245,28 @@ func (cs *ChunkServer) registerWithMaster() {
 
 func (cs *ChunkServer) runHeartbeat() {
 	// create a connection to master and every 5 seconds send the value
-
+	var (
+		conn *grpc.ClientConn
+		err  error
+	)
 	for {
-		conn, err := grpc.NewClient(cs.masterAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err = grpc.NewClient(cs.masterAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			fmt.Println("Connection failed to master")
+			// implement retry mechanism here
 			continue
 		}
-		client := masterpb.NewMasterServiceClient(conn)
+		break
+	}
+	client := masterpb.NewMasterServiceClient(conn)
+	for {
 		ctx := context.Background()
-		client.Heartbeat(ctx)
-		storage, err := disk_usage()
-		if err != nil {
-			fmt.Println("Disk Usage Error ")
-		}
 
 		stream, err := client.Heartbeat(ctx)
+		if err != nil {
+			fmt.Printf("Error while calling heartbeat rpc %s\n", err)
+			continue
+		}
 		wg := new(sync.WaitGroup)
 		wg.Add(2)
 		// now one read thread and one write thread
@@ -277,6 +288,7 @@ func (cs *ChunkServer) runHeartbeat() {
 				deleteTask := msg.GetDeleteTasks()
 				replicationTask := msg.GetReplicationTasks()
 
+				// becomes blocking , when the channel is at capacity --> hence the streaming is blocked .. but its fine for now
 				for _, task := range deleteTask {
 					cs.deleteTask <- task
 				}
@@ -284,14 +296,18 @@ func (cs *ChunkServer) runHeartbeat() {
 					cs.replicationTask <- task
 				}
 			}
-			// should i close the connection ?? idts for now
-			// i should wait for these threads to complete in this routine , since it is non blocking ... think about it for now
-			// need some condition to break out of this loop
+			// the implementation seems fine for now
 		}()
 		// write thread
 		go func() {
-			wg.Done()
+			defer wg.Done()
 			for {
+
+				storage, err := disk_usage()
+				if err != nil {
+					fmt.Println("Disk Usage Error ")
+					continue
+				}
 				// gather the heartbeat response
 				heartbeat := &masterpb.HeartbeatRequest{
 					ServerAddress: cs.myAddress,
@@ -299,18 +315,19 @@ func (cs *ChunkServer) runHeartbeat() {
 					Chunks:        cs.chunks,
 				}
 
-				err := stream.Send(heartbeat)
+				err = stream.Send(heartbeat)
 				if err != nil {
 					fmt.Printf("Error in sending heartbeat from cs %s", cs.myAddress)
 				}
 				time.Sleep(time.Second * 5) // for now , need to check in the master service, what i have configured
-				// find the case to exit this infinite loop
+				// idts there is a need to terminate this loop  .. for now!!
 			}
 		}()
 
 		// use wait group , then the thread ends
 		wg.Wait()
-
+		// time.Sleep()
+		conn.Close()
 	}
 
 }
@@ -327,6 +344,7 @@ func (cs *ChunkServer) replicateAndDeleteTasks() {
 		}
 	}()
 	// delete task --> the channel never closes , so this is an infinitely running routine
+	// althought it is fine , since it is a receiving thread
 	go func() {
 		for task := range cs.deleteTask {
 			// delete these files from the disk
@@ -335,17 +353,21 @@ func (cs *ChunkServer) replicateAndDeleteTasks() {
 				fmt.Printf("Error while deleting file %s\n", err)
 				continue
 			}
-			var index int
+			index := -1
 			for idx, chunkId := range cs.chunks {
 				if chunkId == task.GetChunkId() {
 					index = idx
 					break
 				}
 			}
-
+			// use a mutex here maybe !
 			// deletion trick ( doesn't preserver order )
-			cs.chunks[index] = cs.chunks[len(cs.chunks)-1]
-			cs.chunks = cs.chunks[:len(cs.chunks)-1]
+			if index != -1 {
+				cs.mu.Lock()
+				cs.chunks[index] = cs.chunks[len(cs.chunks)-1]
+				cs.chunks = cs.chunks[:len(cs.chunks)-1]
+				cs.mu.Unlock()
+			}
 
 		}
 	}()
