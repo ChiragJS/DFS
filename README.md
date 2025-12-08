@@ -42,16 +42,16 @@ Data flow:
 * File upload
 * File download
 * Basic master–client communication
+* Metadata management
+* Heartbeats
+* Replica placement
 
 ### To Be Implemented
 
 * Chunking
-* Metadata management
-* Heartbeats
-* Replica placement
 * Write pipeline (primary + replicas)
 * Lease management
-* Master internal subsystems
+* Master internal subsystems ( code isn't clean rn , will focus on it after getting the basic proto up )
 
 ---
 
