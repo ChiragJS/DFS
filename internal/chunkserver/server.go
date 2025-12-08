@@ -18,10 +18,11 @@ import (
 
 type ChunkServer struct {
 	chunkpb.UnimplementedChunkServiceServer
-	myAddress       string
-	masterAddress   string
-	storageDir      string
-	mu              sync.Mutex // implement this for locking chunks
+	myAddress     string
+	masterAddress string
+	storageDir    string
+
+	mu              sync.Mutex
 	chunks          []string
 	replicationTask chan *masterpb.ReplicationTask
 	deleteTask      chan *masterpb.DeleteTask
@@ -54,6 +55,7 @@ func (cs *ChunkServer) Start() error {
 
 	go cs.runHeartbeat()
 	go cs.replicateAndDeleteTasks()
+	go cs.refreshChunks()
 	// the server will only start once it is registered on master
 	// need a thread to monitor delete and replication --> will spawn two threads --> one will do replication , one will delete
 	fmt.Println("ChunkServer listening on", cs.myAddress)
@@ -141,7 +143,7 @@ func (cs *ChunkServer) DownloadChunk(
 }
 
 func (cs *ChunkServer) ReplicateChunkToTarget(chunkId, targetAddress string) error {
-
+	fmt.Println("Start replicate")
 	filePath := filepath.Join(cs.storageDir, chunkId)
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -192,7 +194,7 @@ func (cs *ChunkServer) ReplicateChunkToTarget(chunkId, targetAddress string) err
 	if !resp.Success {
 		return fmt.Errorf("replication to %s failed", targetAddress)
 	}
-
+	fmt.Println("Replication done")
 	return nil
 }
 
@@ -217,8 +219,9 @@ func (cs *ChunkServer) registerWithMaster() {
 			time.Sleep(time.Second)
 			continue
 		}
-
-		chunks := cs.chunks
+		cs.mu.Lock()
+		chunks := append([]string(nil), cs.chunks...)
+		cs.mu.Unlock()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 
@@ -308,11 +311,15 @@ func (cs *ChunkServer) runHeartbeat() {
 					fmt.Println("Disk Usage Error ")
 					continue
 				}
+
+				cs.mu.Lock()
+				chunks := append([]string(nil), cs.chunks...)
+				cs.mu.Unlock()
 				// gather the heartbeat response
 				heartbeat := &masterpb.HeartbeatRequest{
 					ServerAddress: cs.myAddress,
 					FreeStorage:   storage,
-					Chunks:        cs.chunks,
+					Chunks:        chunks,
 				}
 
 				err = stream.Send(heartbeat)
@@ -353,7 +360,9 @@ func (cs *ChunkServer) replicateAndDeleteTasks() {
 				fmt.Printf("Error while deleting file %s\n", err)
 				continue
 			}
+			cs.mu.Lock()
 			index := -1
+
 			for idx, chunkId := range cs.chunks {
 				if chunkId == task.GetChunkId() {
 					index = idx
@@ -363,13 +372,33 @@ func (cs *ChunkServer) replicateAndDeleteTasks() {
 			// use a mutex here maybe !
 			// deletion trick ( doesn't preserver order )
 			if index != -1 {
-				cs.mu.Lock()
 				cs.chunks[index] = cs.chunks[len(cs.chunks)-1]
 				cs.chunks = cs.chunks[:len(cs.chunks)-1]
-				cs.mu.Unlock()
 			}
+			cs.mu.Unlock()
 
 		}
 	}()
 
+}
+
+func (cs *ChunkServer) refreshChunks() {
+
+	for {
+
+		chunks := make([]string, 0)
+
+		filesInDir, err := os.ReadDir(cs.storageDir)
+		if err != nil {
+			fmt.Printf("Error while refreshing Chunk %s \n", err)
+		}
+
+		for _, files := range filesInDir {
+			chunks = append(chunks, files.Name())
+		}
+		cs.mu.Lock()
+		cs.chunks = chunks
+		cs.mu.Unlock()
+		time.Sleep(time.Second * 10)
+	}
 }
