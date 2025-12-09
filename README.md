@@ -1,4 +1,4 @@
-# Simple Distributed File System
+# Distributed File System
 
 This project is a simplified Distributed File System inspired by the architecture of systems like GFS and HDFS. It is designed to demonstrate how a distributed storage layer can be structured, including a master node that manages metadata and multiple chunk servers that store data.
 
