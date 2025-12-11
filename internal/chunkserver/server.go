@@ -51,7 +51,6 @@ func (cs *ChunkServer) Start() error {
 	grpcServer := grpc.NewServer()
 	chunkpb.RegisterChunkServiceServer(grpcServer, cs)
 	// implement a go routine for registering the chunk server // call the master server from there , by creating a connection
-	cs.registerWithMaster()
 
 	go cs.runHeartbeat()
 	go cs.replicateAndDeleteTasks()
@@ -253,87 +252,96 @@ func (cs *ChunkServer) runHeartbeat() {
 		err  error
 	)
 	for {
-		conn, err = grpc.NewClient(cs.masterAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			fmt.Println("Connection failed to master")
-			// implement retry mechanism here
-			continue
-		}
-		break
-	}
-	client := masterpb.NewMasterServiceClient(conn)
-	for {
-		ctx := context.Background()
-
-		stream, err := client.Heartbeat(ctx)
-		if err != nil {
-			fmt.Printf("Error while calling heartbeat rpc %s\n", err)
-			continue
-		}
-		wg := new(sync.WaitGroup)
-		wg.Add(2)
-		// now one read thread and one write thread
-
-		// read thread
-		go func() {
-			defer wg.Done()
-			for {
-				msg, err := stream.Recv()
-				if err == io.EOF {
-					break
-				}
-				// no use of err here
-				if err != nil {
-					fmt.Printf("Error from reading thread of cs %s", cs.myAddress)
-					fmt.Println(err)
-					break // maybe ?? something to think of for now
-				}
-				deleteTask := msg.GetDeleteTasks()
-				replicationTask := msg.GetReplicationTasks()
-
-				// becomes blocking , when the channel is at capacity --> hence the streaming is blocked .. but its fine for now
-				for _, task := range deleteTask {
-					cs.deleteTask <- task
-				}
-				for _, task := range replicationTask {
-					cs.replicationTask <- task
-				}
+		cs.registerWithMaster()
+		// now create a connection to master
+		for {
+			conn, err = grpc.NewClient(cs.masterAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				fmt.Println("Connection failed to master")
+				// implement retry mechanism here
+				continue
 			}
-			// the implementation seems fine for now
-		}()
-		// write thread
-		go func() {
-			defer wg.Done()
-			for {
+			break // connection established
+		}
+		client := masterpb.NewMasterServiceClient(conn)
+		for {
+			ctx := context.Background()
 
-				storage, err := disk_usage()
-				if err != nil {
-					fmt.Println("Disk Usage Error ")
-					continue
-				}
-
-				cs.mu.Lock()
-				chunks := append([]string(nil), cs.chunks...)
-				cs.mu.Unlock()
-				// gather the heartbeat response
-				heartbeat := &masterpb.HeartbeatRequest{
-					ServerAddress: cs.myAddress,
-					FreeStorage:   storage,
-					Chunks:        chunks,
-				}
-
-				err = stream.Send(heartbeat)
-				if err != nil {
-					fmt.Printf("Error in sending heartbeat from cs %s", cs.myAddress)
-				}
-				time.Sleep(time.Second * 5) // for now , need to check in the master service, what i have configured
-				// idts there is a need to terminate this loop  .. for now!!
+			stream, err := client.Heartbeat(ctx)
+			if err != nil {
+				fmt.Printf("Error while calling heartbeat rpc %s\n", err)
+				break // need to re establish the connection
 			}
-		}()
+			wg := new(sync.WaitGroup)
+			wg.Add(2)
+			// now one read thread and one write thread
 
-		// use wait group , then the thread ends
-		wg.Wait()
-		// time.Sleep()
+			// read thread
+			go func() {
+				defer wg.Done()
+				for {
+					msg, err := stream.Recv()
+					if err == io.EOF {
+						break
+					}
+					// no use of err here
+					if err != nil {
+						fmt.Printf("Error from reading thread of cs %s", cs.myAddress)
+						fmt.Println(err)
+						break // maybe ?? something to think of for now
+					}
+					deleteTask := msg.GetDeleteTasks()
+					replicationTask := msg.GetReplicationTasks()
+
+					// becomes blocking , when the channel is at capacity --> hence the streaming is blocked .. but its fine for now
+					for _, task := range deleteTask {
+						cs.deleteTask <- task
+					}
+					for _, task := range replicationTask {
+						cs.replicationTask <- task
+					}
+				}
+				fmt.Println("Exiting read thread now !! ")
+				// the implementation seems fine for now
+			}()
+			// write thread
+			go func() {
+				defer wg.Done()
+				for {
+
+					storage, err := disk_usage()
+					if err != nil {
+						fmt.Println("Disk Usage Error ")
+						continue
+					}
+
+					cs.mu.Lock()
+					chunks := append([]string(nil), cs.chunks...)
+					cs.mu.Unlock()
+					// gather the heartbeat response
+					heartbeat := &masterpb.HeartbeatRequest{
+						ServerAddress: cs.myAddress,
+						FreeStorage:   storage,
+						Chunks:        chunks,
+					}
+
+					err = stream.Send(heartbeat)
+					if err != nil {
+						fmt.Printf("Error in sending heartbeat from cs %s", cs.myAddress)
+						// this means the connection is broken , so need to re establish the connection
+						break
+					}
+					time.Sleep(time.Second * 5) // for now , need to check in the master service, what i have configured
+					// idts there is a need to terminate this loop  .. for now!!
+				}
+
+				fmt.Println("Exiting write thread now ")
+			}()
+
+			// use wait group , then the thread ends
+			wg.Wait()
+			// time.Sleep()
+		}
 		conn.Close()
 	}
 

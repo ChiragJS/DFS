@@ -1,14 +1,6 @@
 package master
 
-// implement --> dead server detection mechanism
-// delete the server from cache , once detected as dead
-// declare it as dead , when it misses 2*HeartBeat time interval
-
-// create a different routine for it , for continual processing
-// do i want it continuously running ?? maybe something to think about
-// in case of network delay , the heart beat may take time .. so in that case , just take care of the hearbeat
-// in case of server crashing and spinning up again
-// it should process registeration
+// TODO : if the master is down , the chunk servers should shift to registerTomaster mode and keep retrying
 
 import (
 	"context"

@@ -21,7 +21,7 @@ func main() {
 
 	resp, err := client.AllocateChunk(context.Background(), &masterpb.AllocateChunkRequest{
 		FileName:   "testFile.txt",
-		ChunkIndex: 2,
+		ChunkIndex: 1,
 	})
 
 	if err != nil {
