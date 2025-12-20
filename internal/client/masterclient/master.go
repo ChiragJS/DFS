@@ -44,14 +44,14 @@ func (mc *MasterClient) GetFileInfo(fileName string) (*masterpb.GetFileInfoRespo
 
 }
 
-func NewMasterClient(address string) *MasterClient {
+func NewMasterClient(address string) (*MasterClient, error) {
 
 	conn, err := grpc.NewClient(
 		address,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 
 	client := masterpb.NewMasterServiceClient(conn)
@@ -60,7 +60,7 @@ func NewMasterClient(address string) *MasterClient {
 		address: address,
 		conn:    conn,
 		client:  client, // storing the client here maybe check why the pointer is not being accepted
-	}
+	}, nil
 
 }
 

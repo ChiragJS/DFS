@@ -14,8 +14,8 @@ func disk_usage() (int64, error) {
 		return 0, err
 	}
 	availableBlocks := stats.Bavail
-	blockSize := stats.Bfree
-	storageAvailable := (availableBlocks * blockSize) / (1024 * 1024)
+	blockSize := stats.Bsize
+	storageAvailable := (int64(availableBlocks) * blockSize) / (1024 * 1024)
 	return int64(storageAvailable), nil
 }
 

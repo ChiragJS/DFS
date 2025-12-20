@@ -31,7 +31,7 @@ func NewChunkClient(address string) (*ChunkClient, error) {
 		client:  client,
 	}, nil
 }
-func (cc *ChunkClient) UploadChunk(chunkID string) (grpc.ClientStream, error) {
+func (cc *ChunkClient) UploadChunk(chunkID string) (grpc.ClientStreamingClient[chunkpb.ChunkData, chunkpb.UploadChunkStatus], error) {
 	// getting the stream object again and again .. hmm something to optimize later
 	stream, err := cc.client.UploadChunk(context.Background())
 	if err != nil {
@@ -53,4 +53,8 @@ func (cc *ChunkClient) DownloadChunk(chunkID string) (grpc.ServerStreamingClient
 	}
 	return stream, err
 	// job of this function is to return a stream object and let the caller use it for now
+}
+
+func (cc *ChunkClient) Close() {
+	cc.conn.Close()
 }

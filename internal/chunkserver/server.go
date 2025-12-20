@@ -223,7 +223,7 @@ func (cs *ChunkServer) registerWithMaster() {
 		cs.mu.Unlock()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-
+		defer cancel()
 		_, err = client.RegisterChunkServer(ctx, &masterpb.RegisterChunkServerRequest{
 			ServerAddress: cs.myAddress,
 			FreeStorage:   free,
@@ -233,13 +233,12 @@ func (cs *ChunkServer) registerWithMaster() {
 		conn.Close()
 
 		if err != nil {
-			fmt.Println("registeration failed , retrying:", err)
+			fmt.Println("registration failed , retrying:", err)
 			time.Sleep(time.Second)
 			continue
 		}
 
 		fmt.Println("successfully registered with master")
-		cancel()
 		return
 	}
 
@@ -259,6 +258,9 @@ func (cs *ChunkServer) runHeartbeat() {
 			if err != nil {
 				fmt.Println("Connection failed to master")
 				// implement retry mechanism here
+				if conn != nil {
+					conn.Close()
+				}
 				continue
 			}
 			break // connection established
@@ -399,6 +401,7 @@ func (cs *ChunkServer) refreshChunks() {
 		filesInDir, err := os.ReadDir(cs.storageDir)
 		if err != nil {
 			fmt.Printf("Error while refreshing Chunk %s \n", err)
+			continue
 		}
 
 		for _, files := range filesInDir {

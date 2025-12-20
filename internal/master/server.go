@@ -104,7 +104,7 @@ func (ms *MasterServer) RegisterChunkServer(ctx context.Context, req *masterpb.R
 			ms.Chunks[chunk] = chunkInfo
 		}
 	}
-	fmt.Println("Success registeration of chunk server %s\n", req.GetServerAddress())
+	fmt.Printf("Success registration of chunk server %s\n", req.GetServerAddress())
 	return &masterpb.RegisterChunkServerResponse{Success: true}, nil
 }
 
@@ -203,7 +203,9 @@ func (ms *MasterServer) Heartbeat(stream grpc.BidiStreamingServer[masterpb.Heart
 		}
 		ms.ReplicationWorks[serverAddress] = make([]*ReplicationWork, 0)
 		for _, task := range deleteTask { // positive assumption
-			delete(ms.Chunks[task.GetChunkId()].Replicas, serverAddress)
+			if chunkInfo, ok := ms.Chunks[task.GetChunkId()]; ok {
+				delete(chunkInfo.Replicas, serverAddress)
+			}
 		}
 		ms.mu.Unlock()
 	}

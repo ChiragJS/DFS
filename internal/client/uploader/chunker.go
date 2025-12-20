@@ -39,9 +39,10 @@ func (chunker *Chunker) NextChunk(buff []byte) ([]byte, int, error) {
 	if err != nil {
 		return nil, 0, err
 		// handle it do something about it for now
+		// might also get EOF ?? handle it the same way for now
 	}
 	chunker.chunkCount++
-	return buff[:n], chunker.chunkCount, nil
+	return buff[:n], chunker.chunkCount - 1, nil
 }
 
 func (chunker *Chunker) GetChunkAtIndex(index int, buff []byte) ([]byte, error) {
