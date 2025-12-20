@@ -20,7 +20,8 @@ import (
 // hardcoding replication factor for now
 var REPLICATION_FACTOR int = 2
 
-const CHUNK_SIZE int64 = 64 * 1024 * 1024 // 64MB
+const CHUNK_SIZE int64 = 64 * 1024 * 1024 // 64MB in bytes
+const CHUNK_SIZE_MB int64 = 64            // 64MB (for storage comparison)
 const LIVE_THRESHOLD = 30 * time.Second   // Server considered dead after this
 
 type MasterServer struct {
@@ -345,12 +346,12 @@ func (ms *MasterServer) buildReplicationTasks(rep []string) {
 				continue
 			}
 
-			if serverStorage[s.addr] < CHUNK_SIZE {
+			if serverStorage[s.addr] < CHUNK_SIZE_MB {
 				continue
 			}
 
 			targets = append(targets, s.addr)
-			serverStorage[s.addr] -= CHUNK_SIZE // simulation
+			serverStorage[s.addr] -= CHUNK_SIZE_MB // simulation
 			replicasNeeded--
 		}
 		// add tasks to ReplicationWorks
@@ -430,7 +431,7 @@ func (ms *MasterServer) AllocateChunk(ctx context.Context, request *masterpb.All
 	validServers := make([]*ChunkServerInfo, 0)
 
 	for _, serverInfo := range ms.ChunkServers {
-		if time.Since(serverInfo.LastHeartbeat) > LIVE_THRESHOLD || serverInfo.FreeStorage < CHUNK_SIZE {
+		if time.Since(serverInfo.LastHeartbeat) > LIVE_THRESHOLD || serverInfo.FreeStorage < CHUNK_SIZE_MB {
 			continue
 		}
 		validServers = append(validServers, serverInfo)
@@ -454,7 +455,7 @@ func (ms *MasterServer) AllocateChunk(ctx context.Context, request *masterpb.All
 		replicaServers = append(replicaServers, validServers[i].Address)
 		replicaServerMap[replicaServers[i]] = true
 		ms.ChunkServers[replicaServers[i]].Chunks[chunkID] = true
-		ms.ChunkServers[replicaServers[i]].FreeStorage -= CHUNK_SIZE
+		ms.ChunkServers[replicaServers[i]].FreeStorage -= CHUNK_SIZE_MB
 	}
 
 	fileMetaData.Chunks = append(fileMetaData.Chunks, chunkID)

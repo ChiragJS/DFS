@@ -1,2 +1,4 @@
 libraryTest.go
 output.txt
+bin/
+data/

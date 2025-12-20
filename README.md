@@ -1,184 +1,274 @@
-# Distributed File System
+# Distributed File System (DFS)
 
-This project is a simplified Distributed File System inspired by the architecture of systems like GFS and HDFS. It is designed to demonstrate how a distributed storage layer can be structured, including a master node that manages metadata and multiple chunk servers that store data.
+A simplified Distributed File System inspired by GFS and HDFS. Features a master node for metadata management and multiple chunk servers for distributed data storage with automatic replication.
 
-The goal is to build a fully functional DFS that supports file uploads, downloads, metadata management, chunk replication, heartbeats, and write pipelines.
+## Quick Start
 
----
+```bash
+# Build all binaries
+go build -o bin/dfs-master ./cmd/master
+go build -o bin/dfs-chunkserver ./cmd/chunkserver
+go build -o bin/dfs-client ./cmd/client
 
-## Table of Contents
+# Start the master server
+./bin/dfs-master
 
-* [Overview](#overview)
-* [Features](#features)
-* [Architecture](#architecture)
-* [Component Diagram](#component-diagram)
-* [Write Sequence](#write-sequence)
-* [Read Sequence](#read-sequence)
-* [ChunkServer Heartbeats](#chunkserver-heartbeats)
-* [Master Node Internal Architecture](#master-node-internal-architecture)
+# Start chunk servers (in separate terminals)
+./bin/dfs-chunkserver -port :9001 -master localhost:8000 -dir ./data/cs1
+./bin/dfs-chunkserver -port :9002 -master localhost:8000 -dir ./data/cs2
 
----
+# Upload a file
+./bin/dfs-client put /path/to/local/file.txt remote-name.txt
 
-## Overview
-
-The system consists of:
-
-* A Client
-* A Master Node
-* Multiple ChunkServers
-
-Data flow:
-
-1. Client asks the master for metadata or chunk placement.
-2. Master returns assigned chunkservers.
-3. Client uploads/downloads data directly from chunkservers.
+# Download a file
+./bin/dfs-client get remote-name.txt /path/to/download/dir
+```
 
 ---
 
 ## Features
 
-### Implemented
+### ✅ Implemented
 
-* File upload
-* File download
-* Basic master–client communication
-* Metadata management
-* Heartbeats
-* Replica placement
+| Feature | Description |
+|---------|-------------|
+| File Upload | Chunked upload with automatic allocation |
+| File Download | Reassembly from distributed chunks |
+| Chunk Replication | Configurable replication factor (default: 2) |
+| Heartbeat System | Bidirectional streaming for health monitoring |
+| Dead Server Detection | Automatic detection and replication triggering |
+| Replica Placement | Storage-aware server selection |
+| Structured Logging | slog-based logging with levels |
+| Client SDK | High-level API for file operations |
+| CLI Tool | Command-line interface for put/get operations |
 
-### To Be Implemented
+### 🔜 Planned
 
-* Chunking
-* Write pipeline (primary + replicas)
-* Lease management
-* Master internal subsystems ( code isn't clean rn , will focus on it after getting the basic proto up )
+- Write pipeline (chain replication)
+- Lease management for primary writes
+- Checksum verification
+- Graceful shutdown handling
 
 ---
 
 ## Architecture
 
-The system follows a master–worker model. The master stores metadata, while chunkservers store data. The client interacts with both.
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                           Client                                 │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  DFSClient SDK                                           │    │
+│  │  ┌───────────┐  ┌────────────┐  ┌────────────────────┐  │    │
+│  │  │ Uploader  │  │ Downloader │  │ MasterClient       │  │    │
+│  │  └───────────┘  └────────────┘  └────────────────────┘  │    │
+│  └─────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              │ gRPC
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                        Master Server                             │
+│  ┌─────────────┐  ┌──────────────┐  ┌────────────────────────┐  │
+│  │ Metadata    │  │ Heartbeat    │  │ Chunk Placement        │  │
+│  │ Manager     │  │ Manager      │  │ Manager                │  │
+│  └─────────────┘  └──────────────┘  └────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              │ gRPC (Heartbeat + Tasks)
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                       Chunk Servers                              │
+│  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐        │
+│  │ ChunkServer 1 │  │ ChunkServer 2 │  │ ChunkServer N │        │
+│  │ :9001         │  │ :9002         │  │ :900N         │        │
+│  └───────────────┘  └───────────────┘  └───────────────┘        │
+└─────────────────────────────────────────────────────────────────┘
+```
 
----
-
-## Component Diagram
+### Component Diagram
 
 ```mermaid
 flowchart TB
-    classDef box fill:#2b2b2b,stroke:#555,color:#fff,stroke-width:2px,rx:8,ry:8,font-size:16px
-    classDef arrow stroke:#999,color:#ccc,stroke-width:2px
+    classDef client fill:#fef08a,stroke:#eab308,color:#1c1917
+    classDef master fill:#c4b5fd,stroke:#8b5cf6,color:#1c1917
+    classDef chunk fill:#93c5fd,stroke:#3b82f6,color:#1c1917
 
-    Client["Client<br/><br/>CLI / API<br/><br/>Issues file operations"]:::box -->|gRPC| MasterNode
+    Client["Client<br/><br/>CLI / SDK<br/>File operations"]:::client --> |gRPC| Master
 
-    subgraph MasterNode["Master Node"]
-        MM["Metadata Manager<br/><br/>File tree<br/>File → Chunk mapping"]:::box
-        HM["Heartbeat Manager<br/><br/>Monitor ChunkServers"]:::box
-        CM["Chunk Placement Manager<br/><br/>Replica selection"]:::box
-        LM["Lease Manager<br/><br/>Primary write control"]:::box
+    subgraph Master["Master Server"]
+        MM["Metadata Manager<br/>File → Chunk mapping"]:::master
+        HM["Heartbeat Manager<br/>Monitor ChunkServers"]:::master
+        CM["Chunk Placement<br/>Replica selection"]:::master
     end
 
     subgraph CSGroup["ChunkServers"]
-        CS1["ChunkServer 1<br/><br/>Stores chunks<br/>Heartbeats<br/>Replication"]:::box
-        CS2["ChunkServer 2<br/><br/>Stores chunks<br/>Heartbeats<br/>Replication"]:::box
-        CS3["ChunkServer 3<br/><br/>Stores chunks<br/>Heartbeats<br/>Replication"]:::box
-        CSN["ChunkServer N<br/><br/>Stores chunks<br/>Heartbeats<br/>Replication"]:::box
+        CS1["ChunkServer 1<br/>:9001"]:::chunk
+        CS2["ChunkServer 2<br/>:9002"]:::chunk
+        CSN["ChunkServer N<br/>:900N"]:::chunk
     end
 
-    MasterNode -->|gRPC| CS1
-    MasterNode -->|gRPC| CS2
-    MasterNode -->|gRPC| CS3
-    MasterNode -->|gRPC| CSN
+    Master --> |Heartbeat| CS1
+    Master --> |Heartbeat| CS2
+    Master --> |Heartbeat| CSN
 
-    Client -->|Read/Write Data| CS1
-    Client -->|Read/Write Data| CS2
-    Client -->|Read/Write Data| CS3
-    Client -->|Read/Write Data| CSN
+    Client --> |Read/Write| CS1
+    Client --> |Read/Write| CS2
+    Client --> |Read/Write| CSN
 ```
 
----
-
-## Write Sequence
+### Write Sequence
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#c4b5fd', 'secondaryColor': '#93c5fd', 'tertiaryColor': '#fef08a', 'primaryTextColor': '#1c1917', 'lineColor': '#8b5cf6'}}}%%
 sequenceDiagram
-    autonumber
     participant C as Client
     participant M as Master
-    participant P as PrimaryChunkServer
-    participant R1 as Replica1
-    participant R2 as Replica2
+    participant CS1 as ChunkServer 1
+    participant CS2 as ChunkServer 2
 
-    C->>M: Request file write
-    M-->>C: Return chunk assignment
-
-    C->>P: Send write data
-    P->>R1: Forward write
-    P->>R2: Forward write
-
-    R1-->>P: Ack
-    R2-->>P: Ack
-
-    P-->>C: Write success
+    C->>M: AllocateChunk(filename, index)
+    M-->>C: ChunkID + ReplicaServers
+    C->>CS1: UploadChunk(stream)
+    CS1-->>C: Success
+    
+    Note over M,CS2: Replication via heartbeat
+    M->>CS1: ReplicationTask
+    CS1->>CS2: ReplicateChunk
+    CS2-->>CS1: Ack
 ```
 
----
-
-## Read Sequence
+### Read Sequence
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#c4b5fd', 'secondaryColor': '#93c5fd', 'tertiaryColor': '#fef08a', 'primaryTextColor': '#1c1917', 'lineColor': '#8b5cf6'}}}%%
 sequenceDiagram
-    autonumber
     participant C as Client
     participant M as Master
     participant CS as ChunkServer
 
-    C->>M: Request metadata
-    M-->>C: Return chunk locations
-
-    C->>CS: Fetch chunk
-    CS-->>C: Return data
+    C->>M: GetFileInfo(filename)
+    M-->>C: ChunkIDs + Locations
+    C->>CS: DownloadChunk(chunkID)
+    CS-->>C: ChunkData stream
 ```
 
 ---
 
-## ChunkServer Heartbeats
+## Project Structure
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant CS as ChunkServer
-    participant M as Master
-
-    loop Every 5 seconds
-        CS->>M: Heartbeat
-        M-->>CS: Commands
-    end
+```
+dfs/
+├── cmd/                    # Entry points
+│   ├── master/main.go      # Master server binary
+│   ├── chunkserver/main.go # Chunk server binary
+│   └── client/main.go      # CLI client binary
+│
+├── internal/               # Private implementation
+│   ├── master/             # Master server logic
+│   ├── chunkserver/        # Chunk server logic
+│   └── client/             # Client SDK
+│       ├── dfsclient.go    # High-level SDK
+│       ├── uploader/       # Upload handling
+│       ├── downloader/     # Download handling
+│       └── masterclient/   # Master communication
+│
+├── pkg/                    # Shared packages
+│   └── logger/             # Structured logging
+│
+├── dfs/                    # Generated protobuf code
+│   ├── masterpb/
+│   └── chunkpb/
+│
+└── proto/                  # Protobuf definitions
 ```
 
 ---
 
-## Master Node Internal Architecture
+## CLI Usage
 
-```mermaid
-flowchart LR
-    classDef box fill:#2b2b2b,stroke:#555,color:#fff,stroke-width:1,rx:6,ry:6
+```bash
+# Upload a file
+./bin/dfs-client put <local-file> <remote-name>
 
-    subgraph Master["Master Node"]
-        RPC["gRPC Server<br/><br/>Handles Client & CS RPCs"]:::box
-        FS["File Namespace Manager<br/><br/>Directory tree"]:::box
-        MM["Chunk Metadata Store<br/><br/>File → Chunk → Replicas"]:::box
-        HB["Heartbeat Manager<br/><br/>Node monitoring"]:::box
-        CP["Chunk Placement<br/><br/>Replica selection<br/>Load balancing"]:::box
-        LM["Lease Manager<br/><br/>Primary write control"]:::box
-    end
+# Download a file
+./bin/dfs-client get <remote-name> <local-directory>
 
-    RPC --> FS
-    RPC --> MM
-    RPC --> HB
-    RPC --> CP
-    RPC --> LM
+# Specify custom master address
+./bin/dfs-client -master localhost:9000 put file.txt myfile.txt
+```
+
+### Chunk Server Flags
+
+```bash
+./bin/dfs-chunkserver [flags]
+
+Flags:
+  -port string    Chunk server address (default ":9001")
+  -master string  Master server address (default ":8000")
+  -dir string     Storage directory (default "./data")
 ```
 
 ---
 
-This document will evolve as implementation progresses.
+## Configuration
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `REPLICATION_FACTOR` | 2 | Number of replicas per chunk |
+| `CHUNK_SIZE` | 64 MB | Size of each chunk |
+| `LIVE_THRESHOLD` | 30s | Server considered dead after this |
+| Heartbeat Interval | 5s | Chunk server heartbeat frequency |
+
+---
+
+## Data Flow
+
+### Write Path
+
+1. Client requests chunk allocation from Master
+2. Master returns ChunkID and replica servers
+3. Client uploads directly to chunk server
+4. Master triggers replication via heartbeat
+
+### Read Path
+
+1. Client requests file info from Master
+2. Master returns chunk locations
+3. Client downloads chunks directly from chunk servers
+4. Client reassembles file from chunks
+
+---
+
+## Heartbeat System
+
+Chunk servers maintain a bidirectional gRPC stream with the master:
+
+**ChunkServer → Master:**
+- Server address
+- Free storage (MB)
+- List of stored chunks
+
+**Master → ChunkServer:**
+- Replication tasks
+- Delete tasks
+
+---
+
+## Development
+
+```bash
+# Build all
+go build ./...
+
+# Run tests
+go test ./...
+
+# Lint
+go vet ./...
+```
+
+---
+
+## License
+
+MIT
