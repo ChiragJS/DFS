@@ -4,6 +4,7 @@ import (
 	"context"
 	"dfs/dfs/chunkpb"
 	"dfs/dfs/masterpb"
+	"dfs/pkg/logger"
 	"fmt"
 	"io"
 	"net"
@@ -57,7 +58,7 @@ func (cs *ChunkServer) Start() error {
 	go cs.refreshChunks()
 	// the server will only start once it is registered on master
 	// need a thread to monitor delete and replication --> will spawn two threads --> one will do replication , one will delete
-	fmt.Println("ChunkServer listening on", cs.myAddress)
+	logger.Info("ChunkServer started", "address", cs.myAddress)
 	return grpcServer.Serve(lis)
 }
 
@@ -68,6 +69,15 @@ func (cs *ChunkServer) UploadChunk(
 	//Checksum left
 	var file *os.File
 	var chunkId string
+
+	// Ensure file is closed on any exit
+	defer func() {
+		if file != nil {
+			file.Sync()
+			file.Close()
+		}
+	}()
+
 	for {
 		msg, err := stream.Recv()
 		if err == io.EOF {
@@ -95,8 +105,11 @@ func (cs *ChunkServer) UploadChunk(
 		}
 
 	}
-	file.Sync()
-	file.Close()
+
+	if file == nil {
+		return fmt.Errorf("no data received")
+	}
+
 	cs.mu.Lock()
 	cs.chunks = append(cs.chunks, chunkId)
 	cs.mu.Unlock()
@@ -142,7 +155,7 @@ func (cs *ChunkServer) DownloadChunk(
 }
 
 func (cs *ChunkServer) ReplicateChunkToTarget(chunkId, targetAddress string) error {
-	fmt.Println("Start replicate")
+	logger.Debug("Starting replication", "chunk", chunkId, "target", targetAddress)
 	filePath := filepath.Join(cs.storageDir, chunkId)
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -193,7 +206,7 @@ func (cs *ChunkServer) ReplicateChunkToTarget(chunkId, targetAddress string) err
 	if !resp.Success {
 		return fmt.Errorf("replication to %s failed", targetAddress)
 	}
-	fmt.Println("Replication done")
+	logger.Debug("Replication completed", "chunk", chunkId, "target", targetAddress)
 	return nil
 }
 
@@ -205,7 +218,7 @@ func (cs *ChunkServer) registerWithMaster() {
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		)
 		if err != nil {
-			fmt.Println("Connection failed, retrying:", err)
+			logger.Error("Connection to master failed", "error", err)
 			time.Sleep(time.Second)
 			continue
 		}
@@ -214,7 +227,7 @@ func (cs *ChunkServer) registerWithMaster() {
 
 		free, err := disk_usage()
 		if err != nil {
-			fmt.Println("Disk usage error:", err)
+			logger.Error("Disk usage check failed", "error", err)
 			time.Sleep(time.Second)
 			continue
 		}
@@ -233,12 +246,12 @@ func (cs *ChunkServer) registerWithMaster() {
 		conn.Close()
 
 		if err != nil {
-			fmt.Println("registration failed , retrying:", err)
+			logger.Error("Registration failed", "error", err)
 			time.Sleep(time.Second)
 			continue
 		}
 
-		fmt.Println("successfully registered with master")
+		logger.Info("Registered with master")
 		return
 	}
 
@@ -271,7 +284,7 @@ func (cs *ChunkServer) runHeartbeat() {
 
 			stream, err := client.Heartbeat(ctx)
 			if err != nil {
-				fmt.Printf("Error while calling heartbeat rpc %s\n", err)
+				logger.Error("Heartbeat RPC failed", "error", err)
 				break // need to re establish the connection
 			}
 			wg := new(sync.WaitGroup)
@@ -288,8 +301,7 @@ func (cs *ChunkServer) runHeartbeat() {
 					}
 					// no use of err here
 					if err != nil {
-						fmt.Printf("Error from reading thread of cs %s", cs.myAddress)
-						fmt.Println(err)
+						logger.Error("Heartbeat read error", "address", cs.myAddress, "error", err)
 						break // maybe ?? something to think of for now
 					}
 					deleteTask := msg.GetDeleteTasks()
@@ -303,7 +315,7 @@ func (cs *ChunkServer) runHeartbeat() {
 						cs.replicationTask <- task
 					}
 				}
-				fmt.Println("Exiting read thread now !! ")
+				logger.Debug("Exiting heartbeat read thread")
 				// the implementation seems fine for now
 			}()
 			// write thread
@@ -313,7 +325,7 @@ func (cs *ChunkServer) runHeartbeat() {
 
 					storage, err := disk_usage()
 					if err != nil {
-						fmt.Println("Disk Usage Error ")
+						logger.Error("Disk usage check failed")
 						continue
 					}
 
@@ -329,7 +341,7 @@ func (cs *ChunkServer) runHeartbeat() {
 
 					err = stream.Send(heartbeat)
 					if err != nil {
-						fmt.Printf("Error in sending heartbeat from cs %s", cs.myAddress)
+						logger.Error("Heartbeat send failed", "address", cs.myAddress)
 						// this means the connection is broken , so need to re establish the connection
 						break
 					}
@@ -337,7 +349,7 @@ func (cs *ChunkServer) runHeartbeat() {
 					// idts there is a need to terminate this loop  .. for now!!
 				}
 
-				fmt.Println("Exiting write thread now ")
+				logger.Debug("Exiting heartbeat write thread")
 			}()
 
 			// use wait group , then the thread ends
@@ -356,7 +368,7 @@ func (cs *ChunkServer) replicateAndDeleteTasks() {
 		for task := range cs.replicationTask {
 			// create a connection to a client
 			if err := cs.ReplicateChunkToTarget(task.GetChunkId(), task.GetTargetAddress()); err != nil {
-				fmt.Printf("Error in Replication %s\n", err)
+				logger.Error("Replication failed", "chunk", task.GetChunkId(), "error", err)
 			}
 		}
 	}()
@@ -367,7 +379,7 @@ func (cs *ChunkServer) replicateAndDeleteTasks() {
 			// delete these files from the disk
 			filePath := filepath.Join(cs.storageDir, task.GetChunkId())
 			if err := os.Remove(filePath); err != nil {
-				fmt.Printf("Error while deleting file %s\n", err)
+				logger.Error("Delete failed", "file", filePath, "error", err)
 				continue
 			}
 			cs.mu.Lock()
@@ -400,7 +412,7 @@ func (cs *ChunkServer) refreshChunks() {
 
 		filesInDir, err := os.ReadDir(cs.storageDir)
 		if err != nil {
-			fmt.Printf("Error while refreshing Chunk %s \n", err)
+			logger.Error("Chunk refresh failed", "error", err)
 			continue
 		}
 

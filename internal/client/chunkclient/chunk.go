@@ -37,7 +37,7 @@ func (cc *ChunkClient) UploadChunk(chunkID string) (grpc.ClientStreamingClient[c
 	if err != nil {
 		return nil, err
 	}
-	return stream, err
+	return stream, nil
 
 	// job of this function is to return a stream object and let the caller use it for now
 }
@@ -51,7 +51,7 @@ func (cc *ChunkClient) DownloadChunk(chunkID string) (grpc.ServerStreamingClient
 	if err != nil {
 		return nil, err
 	}
-	return stream, err
+	return stream, nil
 	// job of this function is to return a stream object and let the caller use it for now
 }
 

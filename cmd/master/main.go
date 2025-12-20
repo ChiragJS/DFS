@@ -2,13 +2,12 @@ package main
 
 import (
 	"dfs/internal/master"
-	"fmt"
+	"dfs/pkg/logger"
 )
 
 func main() {
-	master := master.NewMasterServer()
-	err := master.Start()
-	if err != nil {
-		fmt.Print(err)
+	m := master.NewMasterServer()
+	if err := m.Start(); err != nil {
+		logger.Error("Master server failed", "error", err)
 	}
 }

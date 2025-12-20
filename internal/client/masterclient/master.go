@@ -24,8 +24,7 @@ func (mc *MasterClient) AllocateChunk(fileName string, chunkIndex int32) (*maste
 	}
 	resp, err := mc.client.AllocateChunk(context.Background(), req)
 	if err != nil {
-		// chunk not allocated .. need to retry ?? make the request again ig ... possible error scenarios : master down , network issue
-		return &masterpb.AllocateChunkResponse{ChunkId: "", ReplicaServers: nil}, err
+		return nil, err
 	}
 	return resp, nil
 
@@ -38,7 +37,7 @@ func (mc *MasterClient) GetFileInfo(fileName string) (*masterpb.GetFileInfoRespo
 
 	resp, err := mc.client.GetFileInfo(context.Background(), fileInfoReq)
 	if err != nil {
-		return &masterpb.GetFileInfoResponse{FileInfo: make([]*masterpb.FileChunkInfo, 0)}, err
+		return nil, err
 	}
 	return resp, nil
 

@@ -5,6 +5,7 @@ package master
 import (
 	"context"
 	"dfs/dfs/masterpb"
+	"dfs/pkg/logger"
 	"fmt"
 	"io"
 	"net"
@@ -20,6 +21,7 @@ import (
 var REPLICATION_FACTOR int = 2
 
 const CHUNK_SIZE int64 = 64 * 1024 * 1024 // 64MB
+const LIVE_THRESHOLD = 30 * time.Second   // Server considered dead after this
 
 type MasterServer struct {
 	masterpb.UnimplementedMasterServiceServer
@@ -69,7 +71,7 @@ func (ms *MasterServer) Start() error {
 	}
 	grpcServer := grpc.NewServer()
 	masterpb.RegisterMasterServiceServer(grpcServer, ms)
-	fmt.Println("MasterServer listening on port 8000")
+	logger.Info("MasterServer started", "port", 8000)
 	go ms.detectDeadChunkServer()
 	return grpcServer.Serve(lis)
 
@@ -104,7 +106,7 @@ func (ms *MasterServer) RegisterChunkServer(ctx context.Context, req *masterpb.R
 			ms.Chunks[chunk] = chunkInfo
 		}
 	}
-	fmt.Printf("Success registration of chunk server %s\n", req.GetServerAddress())
+	logger.Info("Chunk server registered", "address", req.GetServerAddress())
 	return &masterpb.RegisterChunkServerResponse{Success: true}, nil
 }
 
@@ -122,7 +124,7 @@ func (ms *MasterServer) Heartbeat(stream grpc.BidiStreamingServer[masterpb.Heart
 		if err != nil {
 			return err
 		}
-		fmt.Printf("Heart beat from server : %s \n", msg.GetServerAddress())
+		logger.Debug("Heartbeat received", "server", msg.GetServerAddress())
 		// Check if the server address exists
 		serverAddress := msg.GetServerAddress()
 
@@ -152,11 +154,13 @@ func (ms *MasterServer) Heartbeat(stream grpc.BidiStreamingServer[masterpb.Heart
 			} else {
 				// if the master knows the task and it is present
 				// check the replication factor
-				if len(ms.Chunks[chunk].Replicas) > REPLICATION_FACTOR {
-					del[chunk] = &masterpb.DeleteTask{ChunkId: chunk}
-				}
-				if len(ms.Chunks[chunk].Replicas) < REPLICATION_FACTOR {
-					rep = append(rep, chunk)
+				if chunkInfo, ok := ms.Chunks[chunk]; ok {
+					if len(chunkInfo.Replicas) > REPLICATION_FACTOR {
+						del[chunk] = &masterpb.DeleteTask{ChunkId: chunk}
+					}
+					if len(chunkInfo.Replicas) < REPLICATION_FACTOR {
+						rep = append(rep, chunk)
+					}
 				}
 			}
 
@@ -194,7 +198,7 @@ func (ms *MasterServer) Heartbeat(stream grpc.BidiStreamingServer[masterpb.Heart
 		}
 		// clear assigned tasks
 		ms.ChunkServers[serverAddress].Chunks = serverChunks
-		fmt.Println(msg.GetServerAddress(), replicationTask, deleteTask)
+		logger.Debug("Heartbeat response", "server", msg.GetServerAddress(), "replication_tasks", len(replicationTask), "delete_tasks", len(deleteTask))
 		if err := stream.Send(&masterpb.HeartbeatResponse{
 			ReplicationTasks: replicationTask,
 			DeleteTasks:      deleteTask,
@@ -277,7 +281,6 @@ func (ms *MasterServer) processNewChunks(serverAddress string, newChunks []strin
 // buildReplicationTasks MUST be called with ms.mu held
 func (ms *MasterServer) buildReplicationTasks(rep []string) {
 
-	const liveThreshold = 30 * time.Second
 	// local snapshot of free server storage
 	serverStorage := make(map[string]int64)
 	for addr, info := range ms.ChunkServers {
@@ -294,7 +297,7 @@ func (ms *MasterServer) buildReplicationTasks(rep []string) {
 		servers = append(servers, srv{
 			addr:  addr,
 			free:  info.FreeStorage,
-			alive: time.Since(info.LastHeartbeat) <= liveThreshold,
+			alive: time.Since(info.LastHeartbeat) <= LIVE_THRESHOLD,
 		})
 	}
 
@@ -317,7 +320,7 @@ func (ms *MasterServer) buildReplicationTasks(rep []string) {
 		// source selection
 		var source string
 		for replica := range ci.Replicas {
-			if info := ms.ChunkServers[replica]; time.Since(info.LastHeartbeat) <= liveThreshold {
+			if info := ms.ChunkServers[replica]; time.Since(info.LastHeartbeat) <= LIVE_THRESHOLD {
 				source = replica
 				break
 			}
@@ -400,7 +403,6 @@ func (ms *MasterServer) AllocateChunk(ctx context.Context, request *masterpb.All
 
 	// gets the file name and chunk index number as input
 	// send the chunkId and the replica servers
-	const liveThreshold = 30 * time.Second
 	fileName := request.GetFileName()
 	chunkIdx := request.GetChunkIndex()
 
@@ -428,7 +430,7 @@ func (ms *MasterServer) AllocateChunk(ctx context.Context, request *masterpb.All
 	validServers := make([]*ChunkServerInfo, 0)
 
 	for _, serverInfo := range ms.ChunkServers {
-		if time.Since(serverInfo.LastHeartbeat) > liveThreshold || serverInfo.FreeStorage < CHUNK_SIZE {
+		if time.Since(serverInfo.LastHeartbeat) > LIVE_THRESHOLD || serverInfo.FreeStorage < CHUNK_SIZE {
 			continue
 		}
 		validServers = append(validServers, serverInfo)
@@ -481,7 +483,6 @@ func (ms *MasterServer) detectDeadChunkServer() {
 
 	// first need to replicate those chunks
 	// here the system assumes that the chunk server might come back online
-	const liveThreshold = time.Second * 30
 	ticker := time.NewTicker(10 * time.Second)
 	for range ticker.C {
 		deadServers := make([]string, 0)
@@ -489,13 +490,15 @@ func (ms *MasterServer) detectDeadChunkServer() {
 		ms.mu.Lock()
 		for serverAddress, info := range ms.ChunkServers {
 
-			if time.Since(info.LastHeartbeat) > liveThreshold { // live threshold
+			if time.Since(info.LastHeartbeat) > LIVE_THRESHOLD { // live threshold
 				// server is dead ( assumption --> so create replication tasks )
 				// create a replication slice and build replication task
 				// i only need the file chunks right --> yes !!
 				for chunk, _ := range ms.ChunkServers[serverAddress].Chunks {
 					chunks = append(chunks, chunk)
-					delete(ms.Chunks[chunk].Replicas, serverAddress)
+					if chunkInfo, ok := ms.Chunks[chunk]; ok {
+						delete(chunkInfo.Replicas, serverAddress)
+					}
 				}
 				deadServers = append(deadServers, serverAddress)
 			}
@@ -504,7 +507,7 @@ func (ms *MasterServer) detectDeadChunkServer() {
 
 		// removes the chunk server from master server
 		for _, dead := range deadServers {
-			fmt.Println(dead)
+			logger.Warn("Dead chunk server detected", "address", dead)
 			delete(ms.ChunkServers, dead)
 		}
 		if len(deadServers) > 0 {

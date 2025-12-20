@@ -2,8 +2,8 @@ package main
 
 import (
 	"dfs/internal/chunkserver"
+	"dfs/pkg/logger"
 	"flag"
-	"fmt"
 )
 
 func main() {
@@ -18,12 +18,11 @@ func main() {
 	flag.StringVar(&dir, "dir", "./data", "storage directory")
 	flag.Parse()
 
-	fmt.Println("Starting chunkserver on", port)
+	logger.Info("Starting chunk server", "port", port, "master", masterAddr, "dir", dir)
 
 	cs := chunkserver.NewChunkServer(port, masterAddr, dir)
 
 	if err := cs.Start(); err != nil {
-		panic(err)
+		logger.Error("Chunk server failed", "error", err)
 	}
-
 }

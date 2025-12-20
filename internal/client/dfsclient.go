@@ -4,6 +4,7 @@ import (
 	"dfs/internal/client/downloader"
 	"dfs/internal/client/masterclient"
 	"dfs/internal/client/uploader"
+	"dfs/pkg/logger"
 	"fmt"
 )
 
@@ -32,25 +33,25 @@ func (dfsClient *DFSClient) Close() {
 }
 
 func (dfsClient *DFSClient) Put(fileName, path string) error {
-	fmt.Printf("Uploading %s to DFS as %s...\n", path, fileName)
+	logger.Info("Starting upload", "file", fileName, "path", path)
 
 	err := dfsClient.uploader.Upload(fileName, path, dfsClient.masterClient)
 	if err != nil {
 		return fmt.Errorf("upload failed: %w", err)
 	}
 
-	fmt.Printf("Successfully uploaded %s\n", fileName)
+	logger.Info("Upload successful", "file", fileName)
 	return nil
 }
 
 func (dfsClient *DFSClient) Get(fileName, downloadPath string) error {
-	fmt.Printf("Downloading %s from DFS to %s...\n", fileName, downloadPath)
+	logger.Info("Starting download", "file", fileName, "path", downloadPath)
 
 	err := dfsClient.downloader.Download(fileName, dfsClient.masterClient, downloadPath)
 	if err != nil {
 		return fmt.Errorf("download failed: %w", err)
 	}
 
-	fmt.Printf("Successfully downloaded to %s/%s\n", downloadPath, fileName)
+	logger.Info("Download successful", "file", fileName, "path", downloadPath)
 	return nil
 }

@@ -3,6 +3,7 @@ package downloader
 import (
 	"dfs/internal/client/chunkclient"
 	"dfs/internal/client/masterclient"
+	"dfs/pkg/logger"
 	"fmt"
 	"io"
 	"os"
@@ -69,7 +70,7 @@ func (dc *Downloader) Download(fileName string, masterClient *masterclient.Maste
 			if _, ok := dc.chunkClients[replicaServer]; !ok {
 				chunkClient, err := chunkclient.NewChunkClient(replicaServer)
 				if err != nil {
-					fmt.Printf("Failed to connect to %s: %v, trying next replica\n", replicaServer, err)
+					logger.Warn("Connection failed, trying next replica", "replica", replicaServer, "error", err)
 					continue // this means connection couldn't be formed so need to get data from other server
 				}
 				dc.chunkClients[replicaServer] = chunkClient
@@ -80,7 +81,7 @@ func (dc *Downloader) Download(fileName string, masterClient *masterclient.Maste
 			chunkClient := dc.chunkClients[replicaServer]
 			stream, err := chunkClient.DownloadChunk(chunkId)
 			if err != nil {
-				fmt.Printf("Failed to start download of chunk %s from %s: %v\n", chunkId, replicaServer, err)
+				logger.Warn("Download start failed", "chunk", chunkId, "replica", replicaServer, "error", err)
 				continue
 			}
 
@@ -94,20 +95,20 @@ func (dc *Downloader) Download(fileName string, masterClient *masterclient.Maste
 					break
 				}
 				if err != nil {
-					fmt.Printf("Stream error while downloading chunk %s: %v\n", chunkId, err)
+					logger.Warn("Stream error", "chunk", chunkId, "error", err)
 					break
 				}
 				buff = append(buff, chunkData.Data...)
 			}
 			// err maybe not useful here
 			if !success {
-				fmt.Printf("Failed to download chunk %s from %s, trying next replica\n", chunkId, replicaServer)
+				logger.Warn("Download failed, trying next replica", "chunk", chunkId, "replica", replicaServer)
 				continue
 			}
 
 			// open a file in append mode
 			if err := dc.writeChunkToFile(buff, filepath.Join(downloadPath, fileName)); err != nil {
-				fmt.Printf("Failed to write chunk %s: %v, trying next replica\n", chunkId, err)
+				logger.Warn("Write failed, trying next replica", "chunk", chunkId, "error", err)
 				continue
 			}
 			// check if the file is downloaded

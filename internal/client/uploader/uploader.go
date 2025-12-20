@@ -4,6 +4,7 @@ import (
 	"dfs/dfs/chunkpb"
 	"dfs/internal/client/chunkclient"
 	"dfs/internal/client/masterclient"
+	"dfs/pkg/logger"
 	"fmt"
 )
 
@@ -30,7 +31,7 @@ func (uc *Uploader) Upload(fileName, path string, masterClient *masterclient.Mas
 		buff, idx, err := chunkerOb.NextChunk(data)
 		// err can also be eof
 		if err != nil {
-			fmt.Println(err)
+			logger.Debug("Finished reading file", "reason", err)
 			break
 		}
 		resp, err := masterClient.AllocateChunk(fileName, int32(idx))
@@ -46,14 +47,14 @@ func (uc *Uploader) Upload(fileName, path string, masterClient *masterclient.Mas
 			if _, ok := uc.chunkServerConn[replica]; !ok {
 				uc.chunkServerConn[replica], err = chunkclient.NewChunkClient(replica)
 				if err != nil {
-					fmt.Printf("Failed to connect to %s: %v, trying next replica\n", replica, err)
+					logger.Warn("Connection failed, trying next replica", "replica", replica, "error", err)
 					continue
 				}
 			}
 
 			stream, err := uc.chunkServerConn[replica].UploadChunk(chunkID)
 			if err != nil {
-				fmt.Printf("Failed to start upload of chunk %s to %s: %v\n", chunkID, replica, err)
+				logger.Warn("Upload start failed", "chunk", chunkID, "replica", replica, "error", err)
 				continue
 			}
 			// 64 kb is sent at once
@@ -70,7 +71,7 @@ func (uc *Uploader) Upload(fileName, path string, masterClient *masterclient.Mas
 					SeqNo:    seqNo,
 					Checksum: 0, // zero for now
 				}); err != nil {
-					fmt.Printf("Failed to send chunk %s data to %s: %v\n", chunkID, replica, err)
+					logger.Warn("Send failed", "chunk", chunkID, "replica", replica, "error", err)
 					sendSuccess = false
 					break
 				}
@@ -84,15 +85,15 @@ func (uc *Uploader) Upload(fileName, path string, masterClient *masterclient.Mas
 
 			resp, err := stream.CloseAndRecv()
 			if err != nil {
-				fmt.Printf("Upload of chunk %s to %s failed: %v\n", chunkID, replica, err)
+				logger.Warn("Upload failed", "chunk", chunkID, "replica", replica, "error", err)
 				continue
 			}
 
 			if !resp.GetSuccess() {
-				fmt.Printf("Upload of chunk %s to %s rejected by server\n", chunkID, replica)
+				logger.Warn("Upload rejected by server", "chunk", chunkID, "replica", replica)
 				continue
 			}
-			fmt.Printf("✓ Upload of chunk %s to %s successful\n", chunkID, replica)
+			logger.Info("Chunk uploaded", "chunk", chunkID, "replica", replica)
 			uploaded = true
 			break
 
